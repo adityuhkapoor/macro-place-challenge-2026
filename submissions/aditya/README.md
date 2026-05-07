@@ -9,6 +9,8 @@ Work in progress.
 | Variant | 3-bench (ibm01/07/14) | All 17 IBM |
 |--|--|--|
 | v4 single-shot (current default) | 1.4063 | **1.4783** |
+| v4 + LNS 30 episodes | 1.4008 | (estimated ~1.47) |
+| v4 + LNS 60 episodes | 1.3991 | (not run) |
 | v4 + K=3 multi-start (jitter=0.04) | 1.3965 | (not run) |
 | RePlAce baseline | 1.3348 | 1.4578 |
 
@@ -27,6 +29,9 @@ benchmark — full-17 verification pending.
   - Boundary penalty + Adam (lr_frac=0.003)
   - Post-process SA disabled (`swap_iters=0` — was net-negative)
 - `placer_multi_v2.py` — K-multi-start wrapper (uses given init + perturbed seeds)
+- `lns_refine.py` — Large Neighborhood Search post-process (subset SA via
+  incremental proxy; episodes-validated against TILOS)
+- `incremental_proxy.py` — fast in-loop proxy evaluator (~2000 moves/sec)
 - `placer.py` — v1 baseline (analytical + radial-search legalize + SA refine)
 - `placer_v2.py`, `placer_v3.py` — intermediate experiments
 - `placer_multi.py`, `placer_multi_v2.py` — multi-start wrappers

@@ -1,30 +1,28 @@
 """
-Aditya v4 — Original analytical placer with three deliberate substitutions
-versus the v-x-zhang reference, all targeting the same underlying problem
-(long-range density + pin-aware HPWL + in-loop congestion).
-
-Substitutions vs vxz / ePlace:
-  1. Density: MULTI-SCALE GAUSSIAN-SMOOTHED density at 4 grid resolutions
-     (8/16/32/64). Each scale's density grid is convolved with a Gaussian
-     kernel; loss penalizes top-k overflow at every scale. Coarse scale gives
-     long-range gradient (analogous to FFT Poisson) but via diffusion not
-     electrostatics. Mathematically distinct: ePlace solves ∇²φ=ρ; ours
-     applies discrete Gaussian smoothing and penalizes the result.
-  2. HPWL: LOG-SUM-EXP smooth max (LSE) on pin positions, not WA. Both are
-     log-sum-exp-family but LSE is the canonical form: max(x) ≈ T·log(Σ exp(x/T)).
-     Different gradient distribution than WA's (Σ x·e^{x/T} / Σ e^{x/T}).
-     Pin offsets used (standard data, not a technique).
-  3. Congestion: PIN-DENSITY top-K (count pins per bin, smooth, top-5%).
-     Captures connector hotspots — different physical signal from RUDY's
-     wire-area hotspots. Inspired by DREAMPlace's pinrudy variant.
+Aditya v4 — Analytical macro placer.
 
 Pipeline:
-  1. Gradient global placement on hard-macro centers (soft kept fixed).
+  1. Gradient-based global placement on hard-macro centers (soft macros fixed).
   2. Radial-search legalization.
-  3. Pairwise-swap SA refinement on weighted pair edges.
+  3. (Optional) pairwise-swap SA refinement on weighted pair edges. Empirically
+     net-negative on TILOS proxy, default disabled (swap_iters=0).
 
-Soft-macro co-optimization is left off pending FFT-grade density (a known
-bell-density failure mode — see placer_v3 experiment notes).
+Loss components:
+  * Wirelength: WA (weighted-average) smooth max on pin positions, with optional
+    LSE alternative. Pin offsets read from .plc.
+      WA_max(x) = Σ x·e^(x/γ) / Σ e^(x/γ), HPWL ≈ WA_max - WA_min.
+  * Density: multi-scale Gaussian-style bell deposition at scales (8, 16, 32,
+    64, TILOS-grid). Bidirectional squared-diff against per-bin target +
+    Coulomb (1/r) coupling at coarse scales (≤16) for long-range distribution.
+  * Congestion: pin-density grid (32×32), box-smoothed, top-5% mean.
+
+Net handling:
+  * High-fanout filter: drop nets with degree > 30 (clock/scan/reset broadcast
+    nets pull everything to centroid).
+  * Soft-macro density floor precomputed and added to hard-macro density grid.
+
+Soft-macro co-optimization left off pending an FFT-grade density model — bell
+deposition collapsed in earlier experiments (see placer_v3 notes).
 """
 
 from __future__ import annotations
@@ -416,23 +414,22 @@ def _rudy_congestion(pin_xy: torch.Tensor, pin_net: torch.Tensor,
                      num_nets: int, net_weights: torch.Tensor,
                      canvas_w: float, canvas_h: float,
                      grid_x: int, grid_y: int,
+                     hroutes_per_micron: float, vroutes_per_micron: float,
                      gamma: float,
                      smooth_range: int = 2,
                      topk_frac: float = 0.05) -> torch.Tensor:
     """
-    RUDY (Rectangular Uniform Density of Wires) congestion proxy:
-      - For each net, compute LSE-smooth bbox.
-      - Treat each net as a rectangle of size (bbox_w, bbox_h) at its center.
-      - Deposit per-net wire demand uniformly across the bbox via bell deposition.
-      - Smooth with box filter, take top-5% mean (matches TILOS aggregation).
-
-    This more closely matches TILOS's Steiner-routed congestion than pin-density:
-    TILOS distributes wire demand across the net's bounding rectangle.
+    RUDY congestion matching TILOS PlacementCost.get_congestion_cost():
+      - Separate H demand (x-span) and V demand (y-span).
+      - Bell-deposit each via net-bbox carrier onto the bin grid.
+      - Normalize by per-bin H/V routing capacity from .plc.
+      - Smooth-range-2 box filter: V spreads horizontally (±2 cols),
+        H spreads vertically (±2 rows).
+      - Score = top-5% ABU of concatenated H+V grids (2× bin count).
     """
     device = pin_xy.device
     dtype = pin_xy.dtype
 
-    # Per-net hard max/min for stability
     very_neg = torch.full((num_nets, 2), -1e9, device=device, dtype=dtype)
     very_pos = torch.full((num_nets, 2), 1e9, device=device, dtype=dtype)
     pin_max = very_neg.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
@@ -440,56 +437,73 @@ def _rudy_congestion(pin_xy: torch.Tensor, pin_net: torch.Tensor,
     pin_min = very_pos.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
                                        pin_xy, reduce="amin", include_self=True)
 
-    # LSE smooth bbox
     e_pos = torch.exp((pin_xy - pin_max[pin_net]) / gamma)
     e_neg = torch.exp(-(pin_xy - pin_min[pin_net]) / gamma)
     s_pos = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
         0, pin_net.unsqueeze(1).expand_as(e_pos), e_pos)
     s_neg = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
         0, pin_net.unsqueeze(1).expand_as(e_neg), e_neg)
-    bb_max = pin_max + gamma * torch.log(s_pos.clamp_min(1e-30))  # [num_nets, 2]
-    bb_min = pin_min - gamma * torch.log(s_neg.clamp_min(1e-30))  # [num_nets, 2]
+    bb_max = pin_max + gamma * torch.log(s_pos.clamp_min(1e-30))
+    bb_min = pin_min - gamma * torch.log(s_neg.clamp_min(1e-30))
 
-    bb_size = (bb_max - bb_min).clamp_min(1e-3)         # [num_nets, 2]
-    bb_center = (bb_max + bb_min) * 0.5                  # [num_nets, 2]
-
-    # Bell deposition for each net (treated as a rect centered at bb_center,
-    # of size bb_size). Same code as _density_at_scale but with net-specific
-    # weights instead of macro areas.
     bin_w = canvas_w / grid_x
     bin_h = canvas_h / grid_y
     bx = (torch.arange(grid_x, device=device, dtype=dtype) + 0.5) * bin_w
     by = (torch.arange(grid_y, device=device, dtype=dtype) + 0.5) * bin_h
 
-    hw = bb_size[:, 0] / 2 + bin_w / 2
-    hh = bb_size[:, 1] / 2 + bin_h / 2
+    # x-span and y-span per net (used as demand magnitudes)
+    x_span = (bb_max[:, 0] - bb_min[:, 0]).clamp_min(0.0)  # [num_nets]
+    y_span = (bb_max[:, 1] - bb_min[:, 1]).clamp_min(0.0)
+    h_demand = x_span * net_weights  # [num_nets]
+    v_demand = y_span * net_weights
 
-    dx = bx.unsqueeze(0) - bb_center[:, 0:1]   # [num_nets, grid_x]
-    dy = by.unsqueeze(0) - bb_center[:, 1:2]   # [num_nets, grid_y]
-    wx = F.relu(1.0 - dx.abs() / hw.unsqueeze(1))
-    wy = F.relu(1.0 - dy.abs() / hh.unsqueeze(1))
-    nx = wx.sum(dim=1, keepdim=True).clamp_min(1e-9)
-    ny = wy.sum(dim=1, keepdim=True).clamp_min(1e-9)
-    wxn = wx / nx
-    wyn = wy / ny
+    # Bell deposition centered at bbox center with half-width = bbox/2 + bin/2
+    cx = (bb_max[:, 0] + bb_min[:, 0]) * 0.5
+    cy = (bb_max[:, 1] + bb_min[:, 1]) * 0.5
+    hwx = (bb_max[:, 0] - bb_min[:, 0]) * 0.5 + bin_w * 0.5
+    hhy = (bb_max[:, 1] - bb_min[:, 1]) * 0.5 + bin_h * 0.5
 
-    # Demand per net per bin: net_weight * unit (since bell is normalized).
-    # The "rectangular uniform density" interpretation says contribution to a
-    # bin is w_n / bbox_area for in-bbox cells; here we use the bell-normalized
-    # version which is differentiable. Mass conservation: each net deposits
-    # exactly net_weight worth of density into the grid.
-    contrib = net_weights.unsqueeze(1)          # [num_nets, 1]
-    grid = (contrib * wyn).t() @ wxn             # [grid_y, grid_x]
+    dx = bx.unsqueeze(0) - cx.unsqueeze(1)   # [num_nets, grid_x]
+    dy = by.unsqueeze(0) - cy.unsqueeze(1)   # [num_nets, grid_y]
+    rwx = F.relu(1.0 - dx.abs() / hwx.unsqueeze(1))
+    rwy = F.relu(1.0 - dy.abs() / hhy.unsqueeze(1))
+    rwx_n = rwx / rwx.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    rwy_n = rwy / rwy.sum(dim=1, keepdim=True).clamp_min(1e-9)
 
-    if smooth_range > 0:
-        ksize = 2 * smooth_range + 1
-        kernel = torch.ones(1, 1, ksize, ksize, device=device, dtype=dtype) / (ksize * ksize)
-        grid = F.conv2d(grid.unsqueeze(0).unsqueeze(0), kernel,
-                        padding=smooth_range).squeeze(0).squeeze(0)
+    # Per-bin H and V demand grids
+    h_grid = (h_demand.unsqueeze(1) * rwy_n).t() @ rwx_n  # [grid_y, grid_x]
+    v_grid = (v_demand.unsqueeze(1) * rwy_n).t() @ rwx_n
 
-    flat = grid.flatten()
-    k = max(1, int(flat.numel() * topk_frac))
-    top, _ = flat.topk(k)
+    # Capacity normalization per the .plc model
+    hcap = hroutes_per_micron * bin_h * bin_w
+    vcap = vroutes_per_micron * bin_h * bin_w
+    h_norm = h_grid / max(hcap, 1e-9)
+    v_norm = v_grid / max(vcap, 1e-9)
+
+    # Smooth: V spreads ±sr horizontally (cols), H spreads ±sr vertically (rows)
+    sr = smooth_range
+    if sr > 0:
+        weight = 1.0 / (2 * sr + 1)
+        v_smooth = torch.zeros_like(v_norm)
+        h_smooth = torch.zeros_like(h_norm)
+        for d in range(-sr, sr + 1):
+            if d < 0:
+                v_smooth[:, -d:] = v_smooth[:, -d:] + v_norm[:, :d] * weight
+                h_smooth[-d:, :] = h_smooth[-d:, :] + h_norm[:d, :] * weight
+            elif d > 0:
+                v_smooth[:, :-d] = v_smooth[:, :-d] + v_norm[:, d:] * weight
+                h_smooth[:-d, :] = h_smooth[:-d, :] + h_norm[d:, :] * weight
+            else:
+                v_smooth = v_smooth + v_norm * weight
+                h_smooth = h_smooth + h_norm * weight
+    else:
+        v_smooth = v_norm
+        h_smooth = h_norm
+
+    # Top-5% ABU of concatenated H+V (2*gx*gy bins)
+    combined = torch.cat([h_smooth.flatten(), v_smooth.flatten()])
+    k = max(1, int(combined.numel() * topk_frac))
+    top, _ = combined.topk(k)
     return top.mean()
 
 
@@ -571,6 +585,10 @@ class AdityaPlacerV4:
                  cong_mode: str = "pin_density",  # "pin_density" | "rudy"
                  lr_schedule: str = "constant",  # "constant" | "cosine"
                  lr_end_frac: float = 0.1,  # cosine end = lr_frac * lr_end_frac
+                 lns_episodes: int = 0,  # 0 = no LNS post-process
+                 lns_subset_size: int = 12,
+                 lns_sa_steps: int = 800,
+                 lns_time_budget: float = 600.0,
                  verbose: bool = False):
         self.seed = seed
         self.global_iters = global_iters
@@ -593,6 +611,10 @@ class AdityaPlacerV4:
         self.cong_mode = cong_mode
         self.lr_schedule = lr_schedule
         self.lr_end_frac = lr_end_frac
+        self.lns_episodes = lns_episodes
+        self.lns_subset_size = lns_subset_size
+        self.lns_sa_steps = lns_sa_steps
+        self.lns_time_budget = lns_time_budget
         self.verbose = verbose
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -790,10 +812,13 @@ class AdityaPlacerV4:
 
             # Congestion proxy
             if self.cong_mode == "rudy":
-                # RUDY at TILOS grid resolution to match scoring
-                cong = _rudy_congestion(owner_pos, pin_net, num_nets, net_weights,
-                                         cw, ch, grid_x=tilos_gc, grid_y=tilos_gr,
-                                         gamma=gamma)
+                cong = _rudy_congestion(
+                    owner_pos, pin_net, num_nets, net_weights,
+                    cw, ch, grid_x=tilos_gc, grid_y=tilos_gr,
+                    hroutes_per_micron=float(benchmark.hroutes_per_micron),
+                    vroutes_per_micron=float(benchmark.vroutes_per_micron),
+                    gamma=gamma,
+                )
             else:
                 cong = _pin_density_congestion(owner_pos, pin_net, net_weights,
                                                 cw, ch, grid_x=32, grid_y=32)
@@ -860,6 +885,21 @@ class AdityaPlacerV4:
         # ---- Assemble ----
         full = benchmark.macro_positions.clone()
         full[:n_hard] = torch.tensor(refined, dtype=torch.float32)
+
+        # ---- LNS post-process (optional) ----
+        if self.lns_episodes > 0:
+            from lns_refine import lns_refine
+            full = lns_refine(
+                full, benchmark, plc,
+                time_budget=self.lns_time_budget,
+                n_episodes=self.lns_episodes,
+                subset_size=self.lns_subset_size,
+                sa_steps=self.lns_sa_steps,
+                sa_mode="greedy",
+                step_init_frac=0.02, step_end_frac=0.0002,
+                seed=self.seed,
+                verbose=self.verbose,
+            )
         return full
 
     def _fallback_no_pins(self, benchmark, hard_var, sizes_hard, movable_hard,

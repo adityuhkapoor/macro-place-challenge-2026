@@ -45,15 +45,11 @@ def run_one(name: str, kwargs: dict):
 
 if __name__ == "__main__":
     # Each entry: (name, kwargs)
-    # Atomic RUDY test
-    BASE = {}  # current defaults
+    # Atomic test: v4 alone vs v4+LNS
     configs = [
-        ("baseline_pindensity", BASE),
-        ("rudy_cong_005", {**BASE, "cong_mode": "rudy"}),
-        ("rudy_cong_02", {**BASE, "cong_mode": "rudy", "cong_w": 0.2}),
-        ("rudy_cong_05", {**BASE, "cong_mode": "rudy", "cong_w": 0.5}),
-        ("rudy_cong_1", {**BASE, "cong_mode": "rudy", "cong_w": 1.0}),
-        ("rudy_cong_0", {**BASE, "cong_mode": "rudy", "cong_w": 0.0}),
+        ("v4_no_lns", {}),
+        ("v4_lns_30ep", {"lns_episodes": 30, "lns_time_budget": 600}),
+        ("v4_lns_60ep", {"lns_episodes": 60, "lns_time_budget": 1200}),
     ]
 
     results = {}
