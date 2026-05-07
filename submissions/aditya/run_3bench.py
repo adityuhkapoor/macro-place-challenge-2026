@@ -50,6 +50,6 @@ def run_3bench(placer):
 
 if __name__ == "__main__":
     from placer_v4 import AdityaPlacerV4
-    placer = AdityaPlacerV4()
-    print(f"=== AdityaPlacerV4 ===")
+    placer = AdityaPlacerV4(lns_episodes=30, lns_time_budget=600)
+    print(f"=== AdityaPlacerV4 (LNS 30ep) ===")
     run_3bench(placer)

@@ -344,6 +344,87 @@ def _density_at_scale(positions: torch.Tensor, sizes: torch.Tensor,
     return (area * wyn).t() @ wxn
 
 
+def _fft_poisson_density_loss(positions: torch.Tensor, sizes: torch.Tensor,
+                               canvas_w: float, canvas_h: float,
+                               fixed_density_floor: dict = None,
+                               tilos_gxgy: tuple = None,
+                               grid_x: int = 64, grid_y: int = 64,
+                               poisson_w: float = 1.0,
+                               match_loss_w: float = 1.0) -> torch.Tensor:
+    """
+    ePlace-style FFT-Poisson density loss.
+
+    Build density grid via bell deposition, solve ∇²φ = -ρ on a doubly-mirrored
+    2N×2N grid (image-charge trick → zero-Neumann BC on the original canvas).
+    Loss = energy ⟨ρ, φ⟩ + bidirectional squared-diff vs target.
+
+    The energy term is the canonical "electrostatic" potential — pulls density
+    toward uniform distribution with correct long-range coupling, unlike
+    multi-scale Gaussian which only captures short/medium range.
+    """
+    # Use TILOS grid if provided, else fixed grid
+    if tilos_gxgy is not None:
+        grid_x, grid_y = tilos_gxgy
+
+    # Total expected mass for normalization
+    total_macro_area = (sizes[:, 0] * sizes[:, 1]).sum()
+    if fixed_density_floor is not None:
+        total_macro_area = total_macro_area + fixed_density_floor.get("total_area", 0.0)
+    canvas_area = canvas_w * canvas_h
+    target_density = total_macro_area / canvas_area
+
+    bin_w = canvas_w / grid_x
+    bin_h = canvas_h / grid_y
+    bin_area = bin_w * bin_h
+    target_per_bin = target_density * bin_area
+
+    rho = _density_at_scale(positions, sizes, canvas_w, canvas_h, grid_x, grid_y)
+    if fixed_density_floor is not None:
+        key = f"tilos_{grid_x}x{grid_y}" if tilos_gxgy is not None else grid_x
+        if key in fixed_density_floor:
+            rho = rho + fixed_density_floor[key]
+
+    # Mean-subtract so total mass is 0 (needed for Poisson well-posedness on
+    # zero-Neumann domain — DC mode has zero eigenvalue).
+    rho_zm = rho - rho.mean()
+
+    # Image-charge mirror: density on [0, L] extends to [0, 2L] with
+    # ρ(2L - x) = ρ(x). The FFT on this 2N grid corresponds to DCT-II on N,
+    # which gives ∇φ·n̂ = 0 (zero-Neumann) at original boundaries.
+    rho_x_mirror = torch.cat([rho_zm, torch.flip(rho_zm, [1])], dim=1)
+    rho_full = torch.cat([rho_x_mirror, torch.flip(rho_x_mirror, [0])], dim=0)
+
+    Ny2, Nx2 = rho_full.shape
+    rho_hat = torch.fft.fft2(rho_full)
+
+    # Laplacian eigenvalues on 2N×2N periodic grid:
+    # λ_kx = -2/dx² · (1 - cos(2πkx/Nx2)), similar for ky
+    kx_idx = torch.arange(Nx2, device=rho.device, dtype=rho.dtype)
+    ky_idx = torch.arange(Ny2, device=rho.device, dtype=rho.dtype)
+    lam_x = -2.0 / (bin_w * bin_w) * (1.0 - torch.cos(2 * math.pi * kx_idx / Nx2))
+    lam_y = -2.0 / (bin_h * bin_h) * (1.0 - torch.cos(2 * math.pi * ky_idx / Ny2))
+    lam = lam_y.unsqueeze(1) + lam_x.unsqueeze(0)  # [Ny2, Nx2]
+    # Avoid div by zero at DC mode (k=0); set to 1, will zero phi_hat[0,0]
+    lam_safe = torch.where(lam.abs() < 1e-12,
+                           torch.ones_like(lam), lam)
+
+    # Solve ∇²φ = -ρ → φ̂ = -ρ̂ / λ
+    phi_hat = -rho_hat / lam_safe
+    phi_hat[0, 0] = 0.0
+    phi_full = torch.fft.ifft2(phi_hat).real
+    phi = phi_full[:grid_y, :grid_x]
+
+    # Energy: <ρ, φ> · bin_area  (drives density to uniform)
+    energy = (rho_zm * phi).sum() * bin_area
+
+    # Bidirectional matching loss against target_per_bin (regularizer for the
+    # actual TILOS top-10% scoring)
+    diff = rho - target_per_bin
+    match_loss = (diff * diff).sum()
+
+    return poisson_w * energy + match_loss_w * match_loss
+
+
 def _multiscale_gaussian_density_loss(positions: torch.Tensor, sizes: torch.Tensor,
                                       canvas_w: float, canvas_h: float,
                                       fixed_density_floor: dict = None,
@@ -576,16 +657,24 @@ class AdityaPlacerV4:
                  anchor_k: int = 0,  # disabled — hypothesis A rejected
                  anchor_w: float = 5.0,
                  anchor_frac: float = 0.5,
-                 init_mode: str = "given",  # "given" | "center"
+                 init_mode: str = "given",  # "given" | "center" | "spectral"
+                 spectral_anchor_w: float = 5.0,
+                 spectral_jitter_frac: float = 0.02,
                  ignore_net_degree: int = 30,  # filter clock/scan/reset broadcast nets
                  cluster_pins_on_macro: bool = False,
                  asymmetric_density: bool = False,
                  coulomb_w: float = 0.1,
                  wl_mode: str = "wa",  # "lse" | "wa"
                  cong_mode: str = "pin_density",  # "pin_density" | "rudy"
+                 density_mode: str = "multiscale",  # "multiscale" | "fft_poisson"
+                 fft_poisson_w: float = 1.0,
+                 fft_match_w: float = 1.0,
                  lr_schedule: str = "constant",  # "constant" | "cosine"
                  lr_end_frac: float = 0.1,  # cosine end = lr_frac * lr_end_frac
-                 lns_episodes: int = 0,  # 0 = no LNS post-process
+                 sgld_noise: float = 0.0,  # Langevin noise scale (0 = disabled)
+                 sgld_start_frac: float = 0.5,  # inject noise from this fraction of iters
+                 sgld_end_frac: float = 0.9,    # stop noise by this fraction
+                 lns_episodes: int = 30,  # default LNS post-process: -0.4% on 3-bench
                  lns_subset_size: int = 12,
                  lns_sa_steps: int = 800,
                  lns_time_budget: float = 600.0,
@@ -603,14 +692,22 @@ class AdityaPlacerV4:
         self.anchor_w = anchor_w
         self.anchor_frac = anchor_frac
         self.init_mode = init_mode
+        self.spectral_anchor_w = spectral_anchor_w
+        self.spectral_jitter_frac = spectral_jitter_frac
         self.ignore_net_degree = ignore_net_degree
         self.cluster_pins_on_macro = cluster_pins_on_macro
         self.asymmetric_density = asymmetric_density
         self.coulomb_w = coulomb_w
         self.wl_mode = wl_mode
         self.cong_mode = cong_mode
+        self.density_mode = density_mode
+        self.fft_poisson_w = fft_poisson_w
+        self.fft_match_w = fft_match_w
         self.lr_schedule = lr_schedule
         self.lr_end_frac = lr_end_frac
+        self.sgld_noise = sgld_noise
+        self.sgld_start_frac = sgld_start_frac
+        self.sgld_end_frac = sgld_end_frac
         self.lns_episodes = lns_episodes
         self.lns_subset_size = lns_subset_size
         self.lns_sa_steps = lns_sa_steps
@@ -647,6 +744,21 @@ class AdityaPlacerV4:
             init_hard[movable_hard] = torch.tensor([cw / 2, ch / 2], device=device)
             jitter = (torch.rand_like(init_hard[movable_hard]) - 0.5) * (scale * 0.1)
             init_hard[movable_hard] = init_hard[movable_hard] + jitter
+        elif self.init_mode == "spectral" and movable_hard.any():
+            from spectral_init import spectral_init
+            sp_pos = spectral_init(
+                benchmark,
+                port_anchor_w=self.spectral_anchor_w,
+                jitter_frac=self.spectral_jitter_frac,
+                seed=self.seed,
+            )
+            if sp_pos is not None:
+                # Only overwrite movable; non-movable stays at given positions.
+                mh = movable_hard
+                init_hard[mh] = sp_pos.to(device)[mh]
+            else:
+                if self.verbose:
+                    print("  [spectral_init returned None — falling back to given]")
 
         hard_var = torch.nn.Parameter(init_hard.clone())
 
@@ -802,13 +914,22 @@ class AdityaPlacerV4:
 
             # Multi-scale Gaussian density with fixed soft-macro floor
             # + TILOS-grid scale for direct alignment with scoring resolution
-            den = _multiscale_gaussian_density_loss(
-                cur_hard, sizes_hard, cw, ch,
-                fixed_density_floor=fixed_density_floor,
-                tilos_gxgy=(tilos_gc, tilos_gr),
-                asymmetric=self.asymmetric_density,
-                coulomb_w=self.coulomb_w,
-            )
+            if self.density_mode == "fft_poisson":
+                den = _fft_poisson_density_loss(
+                    cur_hard, sizes_hard, cw, ch,
+                    fixed_density_floor=fixed_density_floor,
+                    tilos_gxgy=(tilos_gc, tilos_gr),
+                    poisson_w=self.fft_poisson_w,
+                    match_loss_w=self.fft_match_w,
+                )
+            else:
+                den = _multiscale_gaussian_density_loss(
+                    cur_hard, sizes_hard, cw, ch,
+                    fixed_density_floor=fixed_density_floor,
+                    tilos_gxgy=(tilos_gc, tilos_gr),
+                    asymmetric=self.asymmetric_density,
+                    coulomb_w=self.coulomb_w,
+                )
 
             # Congestion proxy
             if self.cong_mode == "rudy":
@@ -860,6 +981,21 @@ class AdityaPlacerV4:
                 bad = ~torch.isfinite(hard_var.grad)
                 if bad.any():
                     hard_var.grad[bad] = 0.0
+                # SGLD: add Langevin noise during escape phase
+                # x_{t+1} = x_t - lr·∇f + √(2·lr·T)·N(0,I)
+                # Cosine-shaped envelope between sgld_start_frac and sgld_end_frac
+                if self.sgld_noise > 0.0 and self.sgld_start_frac <= t <= self.sgld_end_frac:
+                    span = self.sgld_end_frac - self.sgld_start_frac
+                    if span > 1e-9:
+                        u = (t - self.sgld_start_frac) / span  # 0 → 1
+                        envelope = 0.5 * (1.0 + math.cos(math.pi * u))  # 1 → 0
+                    else:
+                        envelope = 1.0
+                    noise_scale = self.sgld_noise * scale * envelope
+                    noise = torch.randn_like(hard_var.grad) * noise_scale
+                    if (~movable_hard).any():
+                        noise[~movable_hard] = 0.0
+                    hard_var.grad = hard_var.grad + noise
             opt.step()
 
             if self.verbose and step % 100 == 0:

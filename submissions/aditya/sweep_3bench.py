@@ -45,11 +45,18 @@ def run_one(name: str, kwargs: dict):
 
 if __name__ == "__main__":
     # Each entry: (name, kwargs)
-    # Atomic test: v4 alone vs v4+LNS
+    # SGLD escape-phase noise sweep (cheap saddle escape)
+    BASE = {}
     configs = [
-        ("v4_no_lns", {}),
-        ("v4_lns_30ep", {"lns_episodes": 30, "lns_time_budget": 600}),
-        ("v4_lns_60ep", {"lns_episodes": 60, "lns_time_budget": 1200}),
+        ("baseline_no_sgld", BASE),
+        ("sgld_001", {**BASE, "sgld_noise": 0.001}),
+        ("sgld_005", {**BASE, "sgld_noise": 0.005}),
+        ("sgld_01", {**BASE, "sgld_noise": 0.01}),
+        ("sgld_02", {**BASE, "sgld_noise": 0.02}),
+        ("sgld_05", {**BASE, "sgld_noise": 0.05}),
+        # Different windows
+        ("sgld_01_early", {**BASE, "sgld_noise": 0.01, "sgld_start_frac": 0.2, "sgld_end_frac": 0.7}),
+        ("sgld_01_late", {**BASE, "sgld_noise": 0.01, "sgld_start_frac": 0.7, "sgld_end_frac": 0.95}),
     ]
 
     results = {}

@@ -126,6 +126,120 @@ def _propose_move(rng: random.Random, x: float, y: float,
     return nx, ny
 
 
+def basin_hop(positions: torch.Tensor,
+              benchmark: Benchmark,
+              plc,
+              time_budget: float = 300.0,
+              n_episodes: int = 200,
+              perturb_frac: float = 0.10,    # canvas fraction of large jump
+              relax_steps: int = 30,         # local relax: K small steps after jump
+              relax_step_frac: float = 0.005,
+              T_init_frac: float = 0.02,     # Metropolis temperature on real proxy
+              seed: int = 0,
+              verbose: bool = False) -> torch.Tensor:
+    """
+    Basin hopping (Wales/Doye 1997): perturb single macro with a large jump,
+    locally relax with K small greedy steps, accept on Metropolis criterion
+    against real TILOS proxy. The local relaxation is the key over plain SA —
+    each move lands in a true local minimum of the surrounding basin.
+    """
+    rng = random.Random(seed)
+    n_hard = benchmark.num_hard_macros
+    movable = benchmark.get_movable_mask()[:n_hard].numpy()
+    movable_idx = np.where(movable)[0].tolist()
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    scale = max(cw, ch)
+
+    orig_positions = benchmark.macro_positions.clone()
+    benchmark.macro_positions = positions.clone()
+    try:
+        incp = IncrementalProxy(benchmark)
+    finally:
+        benchmark.macro_positions = orig_positions
+
+    cur_real = compute_proxy_cost(positions, benchmark, plc)["proxy_cost"]
+    initial_real = cur_real
+    best_real = cur_real
+    best_pos = positions.clone()
+
+    T = T_init_frac * cur_real
+
+    t0 = time.time()
+    accepted = 0
+    rejected = 0
+
+    for episode in range(n_episodes):
+        if time.time() - t0 > time_budget:
+            break
+        if not movable_idx:
+            break
+
+        i = rng.choice(movable_idx)
+        old_x = float(incp.positions[i, 0]); old_y = float(incp.positions[i, 1])
+        hw = float(incp.sizes[i, 0] / 2); hh = float(incp.sizes[i, 1] / 2)
+
+        # Snapshot
+        snap = incp.snapshot()
+
+        # Large jump
+        jump_x, jump_y = _propose_move(rng, old_x, old_y, hw, hh, cw, ch,
+                                        scale * perturb_frac)
+        if incp.positions[i, 0] != jump_x or incp.positions[i, 1] != jump_y:
+            incp.positions[i, 0] = jump_x; incp.positions[i, 1] = jump_y
+            if incp.overlaps_any(i):
+                incp.positions[i, 0] = old_x; incp.positions[i, 1] = old_y
+                rejected += 1
+                continue
+            incp.positions[i, 0] = old_x; incp.positions[i, 1] = old_y
+            incp.move_macro(i, jump_x, jump_y)
+
+        # Local relaxation: K small greedy steps
+        relax_step = scale * relax_step_frac
+        cur_proxy = incp.proxy()
+        for _ in range(relax_steps):
+            cx = float(incp.positions[i, 0]); cy = float(incp.positions[i, 1])
+            nx, ny = _propose_move(rng, cx, cy, hw, hh, cw, ch, relax_step)
+            old_pos = (cx, cy)
+            incp.positions[i, 0] = nx; incp.positions[i, 1] = ny
+            if incp.overlaps_any(i):
+                incp.positions[i, 0] = old_pos[0]; incp.positions[i, 1] = old_pos[1]
+                continue
+            incp.positions[i, 0] = old_pos[0]; incp.positions[i, 1] = old_pos[1]
+            incp.move_macro(i, nx, ny)
+            new_proxy = incp.proxy()
+            if new_proxy < cur_proxy:
+                cur_proxy = new_proxy
+            else:
+                incp.move_macro(i, cx, cy)
+
+        # Validate against TILOS, Metropolis on real proxy
+        new_positions = positions.clone()
+        new_positions[:n_hard, 0] = torch.from_numpy(incp.positions[:n_hard, 0]).float()
+        new_positions[:n_hard, 1] = torch.from_numpy(incp.positions[:n_hard, 1]).float()
+        new_real = compute_proxy_cost(new_positions, benchmark, plc)["proxy_cost"]
+
+        delta = new_real - cur_real
+        if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-12)):
+            cur_real = new_real
+            if new_real < best_real:
+                best_real = new_real
+                best_pos = new_positions.clone()
+                positions = new_positions
+            accepted += 1
+        else:
+            incp.restore(snap)
+            rejected += 1
+
+    if verbose:
+        elapsed = time.time() - t0
+        gain = (best_real - initial_real) / initial_real * 100
+        print(f"  [BH] {accepted} acc / {rejected} rej in {elapsed:.1f}s, "
+              f"start={initial_real:.4f} → best={best_real:.4f} ({gain:+.2f}%)")
+
+    return best_pos
+
+
 def lns_refine(positions: torch.Tensor,
                benchmark: Benchmark,
                plc,
