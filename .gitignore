@@ -72,6 +72,13 @@ checkpoints/
 tmp/
 temp/
 *.tmp
+
+# Private research / scratch (contains upstream code dumps — do not commit)
+.claude/
+
+# Plagiarism-risk: derivative copy of v-x-zhang/macro-place-challenge-2026
+# kept locally for analysis only, not for submission
+submissions/aditya/placer_vxz.py
 # MacroPlacement evaluator (submodule)
 # Keep the submodule but ignore unnecessary files
 external/MacroPlacement/Testcases/

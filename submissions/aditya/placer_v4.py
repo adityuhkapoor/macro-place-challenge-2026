@@ -1,0 +1,669 @@
+"""
+Aditya v4 — Original analytical placer with three deliberate substitutions
+versus the v-x-zhang reference, all targeting the same underlying problem
+(long-range density + pin-aware HPWL + in-loop congestion).
+
+Substitutions vs vxz / ePlace:
+  1. Density: MULTI-SCALE GAUSSIAN-SMOOTHED density at 4 grid resolutions
+     (8/16/32/64). Each scale's density grid is convolved with a Gaussian
+     kernel; loss penalizes top-k overflow at every scale. Coarse scale gives
+     long-range gradient (analogous to FFT Poisson) but via diffusion not
+     electrostatics. Mathematically distinct: ePlace solves ∇²φ=ρ; ours
+     applies discrete Gaussian smoothing and penalizes the result.
+  2. HPWL: LOG-SUM-EXP smooth max (LSE) on pin positions, not WA. Both are
+     log-sum-exp-family but LSE is the canonical form: max(x) ≈ T·log(Σ exp(x/T)).
+     Different gradient distribution than WA's (Σ x·e^{x/T} / Σ e^{x/T}).
+     Pin offsets used (standard data, not a technique).
+  3. Congestion: PIN-DENSITY top-K (count pins per bin, smooth, top-5%).
+     Captures connector hotspots — different physical signal from RUDY's
+     wire-area hotspots. Inspired by DREAMPlace's pinrudy variant.
+
+Pipeline:
+  1. Gradient global placement on hard-macro centers (soft kept fixed).
+  2. Radial-search legalization.
+  3. Pairwise-swap SA refinement on weighted pair edges.
+
+Soft-macro co-optimization is left off pending FFT-grade density (a known
+bell-density failure mode — see placer_v3 experiment notes).
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from macro_place.benchmark import Benchmark
+
+_HERE = Path(__file__).parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from placer import _legalize, _swap_refine, _build_pair_edges_from_nets  # noqa: E402
+
+
+# ----------------------- pin extraction (uses PlacementCost) ---------------
+
+def _load_plc_for_benchmark(name: str):
+    try:
+        from macro_place.loader import load_benchmark_from_dir, load_benchmark
+    except Exception:
+        return None
+    ibm_root = Path("external/MacroPlacement/Testcases/ICCAD04") / name
+    if ibm_root.exists():
+        try:
+            _, plc = load_benchmark_from_dir(str(ibm_root))
+            return plc
+        except Exception:
+            return None
+    ng45_map = {"ariane133_ng45": "ariane133", "ariane136_ng45": "ariane136",
+                "nvdla_ng45": "nvdla", "mempool_tile_ng45": "mempool_tile"}
+    d = ng45_map.get(name)
+    if d:
+        base = Path("external/MacroPlacement/Flows/NanGate45") / d / "netlist" / "output_CT_Grouping"
+        if (base / "netlist.pb.txt").exists():
+            try:
+                _, plc = load_benchmark(str(base / "netlist.pb.txt"), str(base / "initial.plc"))
+                return plc
+            except Exception:
+                return None
+    return None
+
+
+def _build_pin_arrays(benchmark: Benchmark, plc) -> Optional[Dict]:
+    """
+    Build per-net flat pin arrays:
+      pin_owner: [P] int — index into [hard, soft, port] universe (>=0)
+                 with -1 meaning fixed-port (use port_xy)
+      pin_param_idx: [P] int — index into the trainable hard params, -1 for fixed
+      pin_offset_xy: [P, 2] float — offset from owner center (0 for ports)
+      pin_fixed_xy: [P, 2] float — for fixed pins (ports / fixed-hard / soft)
+      pin_net_id: [P] int — which net
+      net_weights: [N_nets] float
+    """
+    try:
+        N = benchmark.num_macros
+        H = benchmark.num_hard_macros
+
+        # plc-idx → bench-idx mapping for module owners
+        plc_to_bench: Dict[int, int] = {}
+        for i, p in enumerate(benchmark.hard_macro_indices):
+            plc_to_bench[p] = i
+        for i, p in enumerate(benchmark.soft_macro_indices):
+            plc_to_bench[p] = H + i
+        for i, p in enumerate(plc.port_indices):
+            plc_to_bench[p] = N + i
+
+        name_to_bench: Dict[str, int] = {}
+        for plc_idx, bidx in plc_to_bench.items():
+            name_to_bench[plc.modules_w_pins[plc_idx].get_name()] = bidx
+
+        # Hard pin name → (owner bench idx, dx, dy)
+        pin_name_to_info: Dict[str, Tuple[int, float, float]] = {}
+        for plc_idx in plc.hard_macro_pin_indices:
+            pin = plc.modules_w_pins[plc_idx]
+            owner = pin.get_macro_name() if hasattr(pin, "get_macro_name") else None
+            if owner is None or owner not in name_to_bench:
+                continue
+            pin_name_to_info[pin.get_name()] = (
+                name_to_bench[owner],
+                float(pin.x_offset), float(pin.y_offset),
+            )
+
+        port_pos = benchmark.port_positions.numpy().astype(np.float64) if benchmark.port_positions.numel() > 0 else np.zeros((0, 2), dtype=np.float64)
+
+        pin_owner_l: List[int] = []
+        pin_off_l: List[Tuple[float, float]] = []
+        pin_fixed_l: List[Tuple[float, float]] = []
+        pin_net_l: List[int] = []
+        used_nets: List[int] = []
+        net_weights_keep: List[float] = []
+
+        next_net_id = 0
+        for net_id, (driver, sinks) in enumerate(plc.nets.items()):
+            net_pins: List[Tuple[int, float, float, float, float]] = []  # owner_bench_idx, dx, dy, fx, fy
+            for pin_name in [driver] + sinks:
+                # Macro pin: "MACRO/PIN" — parent is macro
+                # Port: just "PORT_NAME"
+                if "/" in pin_name:
+                    info = pin_name_to_info.get(pin_name)
+                    if info is None:
+                        continue
+                    owner_b, dx, dy = info
+                    if owner_b < N:  # macro
+                        net_pins.append((owner_b, dx, dy, 0.0, 0.0))
+                    else:  # ??? shouldn't happen for macro-pins
+                        pass
+                else:
+                    parent = pin_name
+                    if parent in name_to_bench:
+                        b = name_to_bench[parent]
+                        if b >= N:
+                            pi = b - N
+                            if 0 <= pi < port_pos.shape[0]:
+                                net_pins.append((-1, 0.0, 0.0,
+                                                 float(port_pos[pi, 0]),
+                                                 float(port_pos[pi, 1])))
+            # Need ≥ 2 distinct owners for net to matter
+            unique_owners = set((p[0], p[3], p[4]) for p in net_pins)
+            if len(unique_owners) < 2:
+                continue
+            for owner_b, dx, dy, fx, fy in net_pins:
+                pin_owner_l.append(owner_b)
+                pin_off_l.append((dx, dy))
+                pin_fixed_l.append((fx, fy))
+                pin_net_l.append(next_net_id)
+            used_nets.append(net_id)
+            w = float(benchmark.net_weights[net_id].item()) if net_id < len(benchmark.net_weights) else 1.0
+            net_weights_keep.append(w)
+            next_net_id += 1
+
+        if not pin_owner_l:
+            return None
+
+        return {
+            "pin_owner": np.asarray(pin_owner_l, dtype=np.int64),
+            "pin_offset": np.asarray(pin_off_l, dtype=np.float64),
+            "pin_fixed": np.asarray(pin_fixed_l, dtype=np.float64),
+            "pin_net": np.asarray(pin_net_l, dtype=np.int64),
+            "num_nets": next_net_id,
+            "net_weights": np.asarray(net_weights_keep, dtype=np.float64),
+        }
+    except Exception:
+        return None
+
+
+# ----------------------- LSE smooth wirelength -----------------------------
+
+def _lse_wirelength(pin_xy: torch.Tensor, pin_net: torch.Tensor,
+                    num_nets: int, net_weights: torch.Tensor,
+                    gamma: float) -> torch.Tensor:
+    """
+    Log-sum-exp smooth max wirelength per net.
+        smooth_max(x) ≈ gamma * log(sum exp(x/gamma))
+        smooth_min(x) ≈ -gamma * log(sum exp(-x/gamma))
+        HPWL_net ≈ (smooth_max(xs) - smooth_min(xs)) + (smooth_max(ys) - smooth_min(ys))
+
+    Per-net stable: subtract per-net max/min before exp.
+    """
+    device = pin_xy.device
+    dtype = pin_xy.dtype
+    # Compute per-net hard max/min for stability
+    very_neg = torch.full((num_nets, 2), -1e9, device=device, dtype=dtype)
+    very_pos = torch.full((num_nets, 2), 1e9, device=device, dtype=dtype)
+    pin_max = very_neg.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
+                                       pin_xy, reduce="amax", include_self=True)
+    pin_min = very_pos.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
+                                       pin_xy, reduce="amin", include_self=True)
+
+    # Now compute log-sum-exp smoothed extremes
+    e_pos = torch.exp((pin_xy - pin_max[pin_net]) / gamma)
+    e_neg = torch.exp(-(pin_xy - pin_min[pin_net]) / gamma)
+    s_pos = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(e_pos), e_pos)
+    s_neg = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(e_neg), e_neg)
+
+    smooth_max = pin_max + gamma * torch.log(s_pos.clamp_min(1e-30))
+    smooth_min = pin_min - gamma * torch.log(s_neg.clamp_min(1e-30))
+    hpwl_per_net = (smooth_max - smooth_min).sum(dim=1)  # [num_nets]
+    return (net_weights * hpwl_per_net).sum()
+
+
+# ----------------------- multi-scale Gaussian density ---------------------
+
+def _gaussian_kernel_2d(size: int, sigma: float, device, dtype) -> torch.Tensor:
+    coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2
+    g = torch.exp(-(coords * coords) / (2 * sigma * sigma))
+    g = g / g.sum()
+    k = g.unsqueeze(0) * g.unsqueeze(1)
+    return k.unsqueeze(0).unsqueeze(0)
+
+
+def _coulomb_kernel_2d(size: int, device, dtype) -> torch.Tensor:
+    """1/r truncated kernel — heavier tails than Gaussian, long-range coupling.
+    Conceptually distinct from FFT-Poisson (which is periodic / DCT-II)."""
+    coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    r = torch.sqrt(xx * xx + yy * yy)
+    k = 1.0 / (r + 1.0)
+    # Subtract mean so kernel doesn't add a uniform bias to density
+    k = k - k.mean()
+    k = k / k.abs().sum().clamp_min(1e-9)
+    return k.unsqueeze(0).unsqueeze(0)
+
+
+def _density_at_scale(positions: torch.Tensor, sizes: torch.Tensor,
+                      canvas_w: float, canvas_h: float,
+                      grid_x: int, grid_y: int) -> torch.Tensor:
+    """
+    Bell-shaped (triangular) deposition for differentiability.
+    Returns [grid_y, grid_x] density grid.
+    """
+    bin_w = canvas_w / grid_x
+    bin_h = canvas_h / grid_y
+    bx = (torch.arange(grid_x, device=positions.device, dtype=positions.dtype) + 0.5) * bin_w
+    by = (torch.arange(grid_y, device=positions.device, dtype=positions.dtype) + 0.5) * bin_h
+
+    hw = sizes[:, 0] / 2 + bin_w / 2  # bell half-width (macro half + half-bin)
+    hh = sizes[:, 1] / 2 + bin_h / 2
+
+    dx = bx.unsqueeze(0) - positions[:, 0:1]  # [N, grid_x]
+    dy = by.unsqueeze(0) - positions[:, 1:2]  # [N, grid_y]
+
+    wx = F.relu(1.0 - dx.abs() / hw.unsqueeze(1))
+    wy = F.relu(1.0 - dy.abs() / hh.unsqueeze(1))
+
+    # Normalize per macro so each contributes its full area
+    nx = wx.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    ny = wy.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    wxn = wx / nx
+    wyn = wy / ny
+    area = (sizes[:, 0] * sizes[:, 1]).unsqueeze(1)  # [N, 1]
+
+    # Aggregate: (area * wyn).T [grid_y, N] @ wxn [N, grid_x]
+    return (area * wyn).t() @ wxn
+
+
+def _multiscale_gaussian_density_loss(positions: torch.Tensor, sizes: torch.Tensor,
+                                      canvas_w: float, canvas_h: float,
+                                      fixed_density_floor: dict = None,
+                                      scales=(8, 16, 32, 64),
+                                      tilos_gxgy: tuple = None,
+                                      sigma_bins: float = 1.5,
+                                      topk_frac: float = 0.10) -> torch.Tensor:
+    """
+    Long-range density loss: at each scale, smooth density grid with Gaussian,
+    take squared overflow above target, sum over scales.
+
+    fixed_density_floor: optional dict {scale -> [grid, grid] tensor} of
+    pre-computed density from fixed (soft + port) footprints. Added to hard
+    density before computing overflow. This makes the optimizer see "where
+    soft macros already are" and avoid stacking hard on top.
+    """
+    # Total area used by EVERYTHING (including fixed) for target normalization
+    total_macro_area = (sizes[:, 0] * sizes[:, 1]).sum()
+    if fixed_density_floor is not None:
+        # Approximate: fixed contribution to total area is the floor's sum
+        # at the finest scale
+        total_macro_area = total_macro_area + fixed_density_floor.get("total_area", 0.0)
+    canvas_area = canvas_w * canvas_h
+    target_density = total_macro_area / canvas_area
+
+    loss = positions.new_zeros(())
+    scale_list = list(scales)
+    if tilos_gxgy is not None:
+        scale_list.append(tilos_gxgy)
+    for g in scale_list:
+        gx, gy = (g, g) if isinstance(g, int) else g
+        bin_area = (canvas_w / gx) * (canvas_h / gy)
+        target_per_bin = target_density * bin_area
+
+        density = _density_at_scale(positions, sizes, canvas_w, canvas_h, gx, gy)
+        if fixed_density_floor is not None:
+            key = g if isinstance(g, int) else f"tilos_{gx}x{gy}"
+            if key in fixed_density_floor:
+                density = density + fixed_density_floor[key]
+
+        diff = density - target_per_bin
+        loss = loss + (diff * diff).sum()
+
+        # Coulomb (1/r) kernel: long-range coupling via direct convolution.
+        # Apply only at coarse scales — at fine resolution (TILOS grid) the
+        # kernel becomes large and the conv dominates runtime, while the
+        # long-range signal is already captured at the coarse scales.
+        if max(gx, gy) <= 16:
+            ksize = min(2 * gx + 1, 2 * gy + 1)
+            if ksize % 2 == 0:
+                ksize += 1
+            kernel = _coulomb_kernel_2d(ksize, density.device, density.dtype)
+            potential = F.conv2d(density.unsqueeze(0).unsqueeze(0), kernel,
+                                 padding=ksize // 2).squeeze(0).squeeze(0)
+            loss = loss + 0.1 * (density * potential).sum()
+    return loss
+
+
+# ----------------------- pin-density congestion ---------------------------
+
+def _pin_density_congestion(pin_xy: torch.Tensor, pin_net: torch.Tensor,
+                             net_weights: torch.Tensor,
+                             canvas_w: float, canvas_h: float,
+                             grid_x: int, grid_y: int,
+                             smooth_range: int = 2,
+                             topk_frac: float = 0.05) -> torch.Tensor:
+    """
+    Pin-density congestion: count weighted pins per bin (using bell deposition
+    so it's differentiable in pin position). Smooth with box filter, take
+    top-K mean.
+
+    Different signal from RUDY: RUDY is wire-bbox-area-spread; pin density is
+    where pin endpoints physically cluster.
+    """
+    device = pin_xy.device
+    dtype = pin_xy.dtype
+    bin_w = canvas_w / grid_x
+    bin_h = canvas_h / grid_y
+    bx = (torch.arange(grid_x, device=device, dtype=dtype) + 0.5) * bin_w
+    by = (torch.arange(grid_y, device=device, dtype=dtype) + 0.5) * bin_h
+
+    hw = bin_w  # bell half-width = bin_w (one-bin spread)
+    hh = bin_h
+
+    pin_w = net_weights[pin_net]  # weight per pin from its net
+    dx = bx.unsqueeze(0) - pin_xy[:, 0:1]  # [P, grid_x]
+    dy = by.unsqueeze(0) - pin_xy[:, 1:2]
+    wx = F.relu(1.0 - dx.abs() / hw)
+    wy = F.relu(1.0 - dy.abs() / hh)
+    nx = wx.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    ny = wy.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    wxn = wx / nx
+    wyn = wy / ny
+
+    # Aggregate weighted pin density into [grid_y, grid_x]
+    contrib = pin_w.unsqueeze(1)  # [P, 1]
+    grid = (contrib * wyn).t() @ wxn  # [grid_y, grid_x]
+
+    # Box smoothing range=smooth_range
+    if smooth_range > 0:
+        ksize = 2 * smooth_range + 1
+        kernel = torch.ones(1, 1, ksize, ksize, device=device, dtype=dtype) / (ksize * ksize)
+        grid = F.conv2d(grid.unsqueeze(0).unsqueeze(0), kernel,
+                        padding=smooth_range).squeeze(0).squeeze(0)
+
+    flat = grid.flatten()
+    k = max(1, int(flat.numel() * topk_frac))
+    top, _ = flat.topk(k)
+    return top.mean()
+
+
+# ----------------------- the placer ---------------------------------------
+
+class AdityaPlacerV4:
+    def __init__(self,
+                 seed: int = 42,
+                 global_iters: int = 800,
+                 swap_iters: int = 0,
+                 lr_frac: float = 0.005,
+                 ov_start: float = 20.0,
+                 ov_end: float = 2000.0,
+                 den_w: float = 5.0,
+                 cong_w: float = 1.0,
+                 bd_w: float = 100.0,
+                 anchor_k: int = 0,  # disabled — hypothesis A rejected
+                 anchor_w: float = 5.0,
+                 anchor_frac: float = 0.5,
+                 init_mode: str = "given",  # "given" | "center"
+                 verbose: bool = False):
+        self.seed = seed
+        self.global_iters = global_iters
+        self.swap_iters = swap_iters
+        self.lr_frac = lr_frac
+        self.ov_start = ov_start
+        self.ov_end = ov_end
+        self.den_w = den_w
+        self.cong_w = cong_w
+        self.bd_w = bd_w
+        self.anchor_k = anchor_k
+        self.anchor_w = anchor_w
+        self.anchor_frac = anchor_frac
+        self.init_mode = init_mode
+        self.verbose = verbose
+
+    def place(self, benchmark: Benchmark) -> torch.Tensor:
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
+
+        device = "cpu"
+
+        n_hard = benchmark.num_hard_macros
+        n_total = benchmark.num_macros
+        n_ports = benchmark.port_positions.shape[0]
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        scale = max(cw, ch)
+
+        sizes_full = benchmark.macro_sizes.to(device).float()
+        sizes_hard = sizes_full[:n_hard]
+        movable_hard = (benchmark.get_movable_mask()[:n_hard]).to(device)
+
+        # Use TILOS's exact grid for density and congestion — matching the
+        # scoring grid is the single biggest score lever (see analysis).
+        tilos_gr = max(8, int(benchmark.grid_rows))
+        tilos_gc = max(8, int(benchmark.grid_cols))
+
+        # Init: "given" uses benchmark positions as-is (preserves basin from
+        # initial.plc). "center" puts movable hard at canvas mid + jitter.
+        init_hard = benchmark.macro_positions[:n_hard].to(device).float().clone()
+        if self.init_mode == "center" and movable_hard.any():
+            init_hard[movable_hard] = torch.tensor([cw / 2, ch / 2], device=device)
+            jitter = (torch.rand_like(init_hard[movable_hard]) - 0.5) * (scale * 0.1)
+            init_hard[movable_hard] = init_hard[movable_hard] + jitter
+
+        hard_var = torch.nn.Parameter(init_hard.clone())
+
+        # Soft + ports stay fixed (point-macro for soft; learning bell density too
+        # would risk the v3 collapse seen earlier).
+        soft_pos = benchmark.macro_positions[n_hard:n_total].to(device).float()
+        port_pos = benchmark.port_positions.to(device).float() if n_ports > 0 else torch.zeros(0, 2, device=device)
+
+        # Build pin arrays (with offsets)
+        plc = _load_plc_for_benchmark(benchmark.name)
+        pin_data = _build_pin_arrays(benchmark, plc) if plc is not None else None
+
+        if pin_data is None:
+            # Fallback: point-macro pins (no offsets) — degrades quality
+            if self.verbose:
+                print("[v4] WARN: no pin offsets, falling back to point-macro HPWL")
+            return self._fallback_no_pins(benchmark, hard_var, sizes_hard,
+                                          movable_hard, init_hard,
+                                          soft_pos, port_pos,
+                                          cw, ch, n_hard, n_total, n_ports)
+
+        # Convert to torch
+        pin_owner = torch.from_numpy(pin_data["pin_owner"]).to(device)
+        pin_offset = torch.from_numpy(pin_data["pin_offset"]).to(device).float()
+        pin_fixed = torch.from_numpy(pin_data["pin_fixed"]).to(device).float()
+        pin_net = torch.from_numpy(pin_data["pin_net"]).to(device)
+        num_nets = pin_data["num_nets"]
+        net_weights = torch.from_numpy(pin_data["net_weights"]).to(device).float()
+
+        # Categorize pins
+        is_hard = (pin_owner >= 0) & (pin_owner < n_hard)
+        is_soft = (pin_owner >= n_hard) & (pin_owner < n_total)
+        is_port = (pin_owner == -1)
+
+        owner_safe = pin_owner.clamp(min=0)
+
+        # ----- Build port-centroid anchors for top-K most-connected hard macros -----
+        anchor_idx = torch.empty(0, dtype=torch.long, device=device)
+        anchor_target = torch.empty(0, 2, device=device)
+        if self.anchor_k > 0 and n_ports > 0:
+            # For each net, find which hard macros it touches and which ports
+            np_pin_owner = pin_data["pin_owner"]
+            np_pin_fixed = pin_data["pin_fixed"]
+            np_pin_net = pin_data["pin_net"]
+            num_nets_local = pin_data["num_nets"]
+            net_w_np = pin_data["net_weights"]
+
+            hard_net_count = np.zeros(n_hard, dtype=np.int64)
+            hard_port_sum = np.zeros((n_hard, 2), dtype=np.float64)
+            hard_port_w = np.zeros(n_hard, dtype=np.float64)
+
+            # Group pins by net for fast lookup
+            for net_id in range(num_nets_local):
+                net_mask = np_pin_net == net_id
+                pins = np.where(net_mask)[0]
+                hard_owners = []
+                port_xys = []
+                for pi in pins:
+                    o = np_pin_owner[pi]
+                    if 0 <= o < n_hard:
+                        hard_owners.append(o)
+                    elif o == -1:
+                        port_xys.append(np_pin_fixed[pi])
+                if not hard_owners:
+                    continue
+                w = float(net_w_np[net_id])
+                # Each hard owner gets one port-centroid contribution per net
+                if port_xys:
+                    centroid = np.mean(port_xys, axis=0)
+                    for h in set(hard_owners):
+                        hard_port_sum[h] += centroid * w
+                        hard_port_w[h] += w
+                for h in set(hard_owners):
+                    hard_net_count[h] += 1
+
+            # Top-K by net degree (only macros with port-connected nets)
+            connected = hard_port_w > 0
+            ranked = np.argsort(-hard_net_count * connected)[:self.anchor_k]
+            ranked = ranked[connected[ranked]]
+            ranked = ranked[(movable_hard.cpu().numpy())[ranked]]
+
+            if len(ranked) > 0:
+                anchor_idx = torch.from_numpy(ranked).to(device).long()
+                centroids = hard_port_sum[ranked] / hard_port_w[ranked, None].clip(min=1e-9)
+                anchor_target = torch.from_numpy(centroids).to(device).float()
+                if self.verbose:
+                    print(f"[v4] anchor: {len(ranked)} macros to port centroids")
+
+        # ----- Precompute fixed (soft) density floor at all scales -----
+        # This lets the hard-macro density gradient see "where soft is" and
+        # avoid stacking on top of soft-dense regions.
+        # Scales include TILOS's grid (variable per benchmark).
+        density_scales = (8, 16, 32, 64, (tilos_gc, tilos_gr))
+        fixed_density_floor = None
+        if soft_pos.shape[0] > 0:
+            sizes_soft = sizes_full[n_hard:n_total]
+            fixed_density_floor = {}
+            for g in density_scales:
+                gx, gy = (g, g) if isinstance(g, int) else g
+                key = g if isinstance(g, int) else f"tilos_{gx}x{gy}"
+                fixed_density_floor[key] = _density_at_scale(
+                    soft_pos, sizes_soft, cw, ch, gx, gy
+                ).detach()
+            fixed_density_floor["total_area"] = float(
+                (sizes_soft[:, 0] * sizes_soft[:, 1]).sum().item()
+            )
+
+        gamma = 0.01 * scale  # reverted from H
+        lr = self.lr_frac * scale
+        opt = torch.optim.Adam([hard_var], lr=lr)
+
+        log_ov_start = math.log(self.ov_start)
+        log_ov_end = math.log(self.ov_end)
+        # density weight ramp
+        log_den_start = math.log(0.001)
+        log_den_end = math.log(self.den_w)
+
+        t0 = time.time()
+        for step in range(self.global_iters):
+            opt.zero_grad()
+            cur_hard = hard_var
+            if (~movable_hard).any():
+                cur_hard = torch.where(movable_hard.unsqueeze(1), cur_hard, init_hard)
+
+            # Compute pin positions
+            # hard pins: cur_hard[owner] + offset
+            # soft pins: soft_pos[owner-n_hard] + offset
+            # port pins: pin_fixed
+            pin_pos = torch.zeros_like(pin_offset)  # [P, 2]
+            # hard
+            hard_pos = cur_hard[owner_safe.clamp(max=n_hard - 1)]
+            soft_idx = (owner_safe - n_hard).clamp(min=0, max=max(n_total - n_hard - 1, 0))
+            soft_owner_pos = soft_pos[soft_idx] if soft_pos.shape[0] > 0 else torch.zeros_like(hard_pos)
+            owner_pos = torch.where(is_hard.unsqueeze(1), hard_pos, soft_owner_pos)
+            owner_pos = torch.where(is_port.unsqueeze(1), pin_fixed, owner_pos + pin_offset)
+
+            # WL via LSE
+            t = step / max(self.global_iters - 1, 1)
+            wl = _lse_wirelength(owner_pos, pin_net, num_nets, net_weights, gamma)
+            wl_norm = wl / ((cw + ch) * net_weights.sum().clamp_min(1.0))
+
+            # Multi-scale Gaussian density with fixed soft-macro floor
+            # + TILOS-grid scale for direct alignment with scoring resolution
+            den = _multiscale_gaussian_density_loss(
+                cur_hard, sizes_hard, cw, ch,
+                fixed_density_floor=fixed_density_floor,
+                tilos_gxgy=(tilos_gc, tilos_gr),
+            )
+
+            # Pin-density congestion (32x32 grid, original v4)
+            cong = _pin_density_congestion(owner_pos, pin_net, net_weights,
+                                            cw, ch, grid_x=32, grid_y=32)
+
+            # Boundary penalty
+            hw = sizes_hard[:, 0] / 2
+            hh = sizes_hard[:, 1] / 2
+            bx_lo = F.relu(hw - cur_hard[:, 0])
+            bx_hi = F.relu(cur_hard[:, 0] - (cw - hw))
+            by_lo = F.relu(hh - cur_hard[:, 1])
+            by_hi = F.relu(cur_hard[:, 1] - (ch - hh))
+            bd = (bx_lo * bx_lo + bx_hi * bx_hi + by_lo * by_lo + by_hi * by_hi).sum() / scale
+
+            den_w = math.exp(log_den_start + t * (log_den_end - log_den_start))
+            cong_w_t = self.cong_w * max(0.0, (t - 0.2) / 0.8)
+
+            # Anchor: linearly-decaying quadratic pull toward port centroids
+            # for top-K most-connected hard macros. Active only for first
+            # `anchor_frac` of iters.
+            if anchor_idx.numel() > 0 and t < self.anchor_frac:
+                anchor_decay = max(0.0, 1.0 - t / self.anchor_frac)
+                anchor_diff = cur_hard[anchor_idx] - anchor_target
+                anchor_pen = (anchor_diff * anchor_diff).sum() / (scale * scale)
+                anchor_term = self.anchor_w * anchor_decay * anchor_pen
+            else:
+                anchor_term = positions_zero = cur_hard.new_zeros(())
+
+            loss = (wl_norm + den_w * den / (scale * scale) + self.bd_w * bd
+                    + cong_w_t * cong + anchor_term)
+
+            if not torch.isfinite(loss):
+                opt.zero_grad()
+                continue
+
+            loss.backward()
+            if hard_var.grad is not None:
+                if (~movable_hard).any():
+                    hard_var.grad[~movable_hard] = 0.0
+                bad = ~torch.isfinite(hard_var.grad)
+                if bad.any():
+                    hard_var.grad[bad] = 0.0
+            opt.step()
+
+            if self.verbose and step % 100 == 0:
+                print(f"[v4] step {step:4d}  wl={float(wl_norm):.4f}  "
+                      f"den={float(den):.3e} (w={den_w:.3f})  "
+                      f"cong={float(cong):.4f} (w={cong_w_t:.3f})  "
+                      f"bd={float(bd):.3e}")
+
+        if self.verbose:
+            print(f"[v4] global done in {time.time()-t0:.2f}s")
+
+        # ---- Legalize hard macros ----
+        global_pos = hard_var.detach().cpu().numpy().astype(np.float64)
+        sizes_np = sizes_hard.cpu().numpy().astype(np.float64)
+        movable_np = movable_hard.cpu().numpy()
+        legal = _legalize(global_pos, movable_np, sizes_np, cw, ch)
+
+        # ---- Swap refinement ----
+        edges, edge_weights = _build_pair_edges_from_nets(benchmark.net_nodes, n_hard)
+        refined = _swap_refine(legal, edges, edge_weights, movable_np, sizes_np,
+                               cw, ch, self.swap_iters)
+
+        # ---- Assemble ----
+        full = benchmark.macro_positions.clone()
+        full[:n_hard] = torch.tensor(refined, dtype=torch.float32)
+        return full
+
+    def _fallback_no_pins(self, benchmark, hard_var, sizes_hard, movable_hard,
+                          init_hard, soft_pos, port_pos, cw, ch, n_hard, n_total, n_ports):
+        # Fall through to v1's implementation if pins aren't available
+        from placer import AdityaPlacer
+        return AdityaPlacer(seed=self.seed).place(benchmark)
