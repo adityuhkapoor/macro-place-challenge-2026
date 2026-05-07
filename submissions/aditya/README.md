@@ -4,17 +4,29 @@ Original placer attempts for the Partcl/HRT Macro Placement Challenge.
 
 ## Status
 
-Work in progress. Best result so far: **avg 1.4634** on 3-benchmark subset
-(ibm01/07/14) — see `run_3bench.py`. Full 17-benchmark score is pending.
+Work in progress.
+
+| Variant | 3-bench (ibm01/07/14) | All 17 IBM |
+|--|--|--|
+| v4 single-shot (current default) | 1.4063 | **1.4783** |
+| v4 + K=3 multi-start (jitter=0.04) | 1.3965 | (not run) |
+| RePlAce baseline | 1.3348 | 1.4578 |
+
+Single-shot v4 beats RePlAce on 12/17 benchmarks; ibm02 and ibm10 are the
+weakest. Multi-start gives -0.7% on the 3-bench but ~5-10× slower per
+benchmark — full-17 verification pending.
 
 ## Files
 
 - `placer_v4.py` — current best placer. Analytical global placement with:
-  - LSE wirelength on pin offsets
-  - Multi-scale Gaussian density loss with Coulomb (1/r) coupling at coarse scales
-  - Pin-density congestion proxy
+  - WA (weighted-average) wirelength on pin offsets, gamma=0.01·canvas_scale
+  - High-fanout net filter (degree > 30 dropped)
+  - Multi-scale density loss with Coulomb (1/r) coupling at coarse scales (≤16)
+  - Pin-density congestion proxy at 32×32 with low cong_w=0.05
   - Soft-macro density floor (precomputed)
-  - Boundary penalty + Adam optimizer
+  - Boundary penalty + Adam (lr_frac=0.003)
+  - Post-process SA disabled (`swap_iters=0` — was net-negative)
+- `placer_multi_v2.py` — K-multi-start wrapper (uses given init + perturbed seeds)
 - `placer.py` — v1 baseline (analytical + radial-search legalize + SA refine)
 - `placer_v2.py`, `placer_v3.py` — intermediate experiments
 - `placer_multi.py`, `placer_multi_v2.py` — multi-start wrappers

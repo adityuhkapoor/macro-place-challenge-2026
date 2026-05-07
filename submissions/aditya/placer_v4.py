@@ -76,7 +76,9 @@ def _load_plc_for_benchmark(name: str):
     return None
 
 
-def _build_pin_arrays(benchmark: Benchmark, plc) -> Optional[Dict]:
+def _build_pin_arrays(benchmark: Benchmark, plc,
+                      ignore_net_degree: int = 0,
+                      cluster_pins_on_macro: bool = False) -> Optional[Dict]:
     """
     Build per-net flat pin arrays:
       pin_owner: [P] int — index into [hard, soft, port] universe (>=0)
@@ -126,6 +128,7 @@ def _build_pin_arrays(benchmark: Benchmark, plc) -> Optional[Dict]:
         net_weights_keep: List[float] = []
 
         next_net_id = 0
+        cluster_count = [0]  # mutable closure for diagnostics
         for net_id, (driver, sinks) in enumerate(plc.nets.items()):
             net_pins: List[Tuple[int, float, float, float, float]] = []  # owner_bench_idx, dx, dy, fx, fy
             for pin_name in [driver] + sinks:
@@ -154,6 +157,38 @@ def _build_pin_arrays(benchmark: Benchmark, plc) -> Optional[Dict]:
             unique_owners = set((p[0], p[3], p[4]) for p in net_pins)
             if len(unique_owners) < 2:
                 continue
+            # Drop high-fanout nets (clock/scan/reset broadcast) — they pull
+            # everything to centroid and dominate gradient. DREAMPlace default
+            # threshold is 100; Hier-RTLMP folklore is 50.
+            if ignore_net_degree > 0 and len(net_pins) > ignore_net_degree:
+                continue
+            # Pin clustering on macros: multiple pins on same macro inflate
+            # net bbox even when macro is at optimal location. Aggregate to
+            # median offset per (owner, net) to remove degenerate stretch.
+            if cluster_pins_on_macro:
+                from collections import defaultdict
+                by_owner = defaultdict(list)
+                for p in net_pins:
+                    if p[0] >= 0:  # macro-owned
+                        by_owner[p[0]].append(p)
+                    else:  # port — keep distinct
+                        by_owner[("port", p[3], p[4])].append(p)
+                clustered = []
+                got_clustered = False
+                for key, pins in by_owner.items():
+                    if isinstance(key, int) and len(pins) > 1:
+                        got_clustered = True
+                        # Median offset for this macro on this net
+                        dxs = sorted(p[1] for p in pins)
+                        dys = sorted(p[2] for p in pins)
+                        mdx = dxs[len(dxs) // 2]
+                        mdy = dys[len(dys) // 2]
+                        clustered.append((pins[0][0], mdx, mdy, 0.0, 0.0))
+                    else:
+                        clustered.extend(pins)
+                if got_clustered:
+                    cluster_count[0] = cluster_count[0] + 1
+                net_pins = clustered
             for owner_b, dx, dy, fx, fy in net_pins:
                 pin_owner_l.append(owner_b)
                 pin_off_l.append((dx, dy))
@@ -180,6 +215,46 @@ def _build_pin_arrays(benchmark: Benchmark, plc) -> Optional[Dict]:
 
 
 # ----------------------- LSE smooth wirelength -----------------------------
+
+def _wa_wirelength(pin_xy: torch.Tensor, pin_net: torch.Tensor,
+                   num_nets: int, net_weights: torch.Tensor,
+                   gamma: float) -> torch.Tensor:
+    """
+    Weighted-average wirelength per net (DREAMPlace / AutoDMP standard):
+        WA_max(x) = Σ x·e^(x/γ) / Σ e^(x/γ)
+        WA_min(x) = Σ x·e^(-x/γ) / Σ e^(-x/γ)
+        HPWL_net ≈ (WA_max(xs) - WA_min(xs)) + (WA_max(ys) - WA_min(ys))
+    Smoother gradient than LSE — gradient flows to all pins, not just extremes.
+    """
+    device = pin_xy.device
+    dtype = pin_xy.dtype
+    very_neg = torch.full((num_nets, 2), -1e9, device=device, dtype=dtype)
+    very_pos = torch.full((num_nets, 2), 1e9, device=device, dtype=dtype)
+    pin_max = very_neg.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
+                                       pin_xy, reduce="amax", include_self=True)
+    pin_min = very_pos.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
+                                       pin_xy, reduce="amin", include_self=True)
+
+    # Stabilize: subtract per-net max for e^(x/γ), per-net min for e^(-x/γ)
+    e_pos = torch.exp((pin_xy - pin_max[pin_net]) / gamma)        # [P, 2]
+    e_neg = torch.exp(-(pin_xy - pin_min[pin_net]) / gamma)       # [P, 2]
+    xe_pos = pin_xy * e_pos
+    xe_neg = pin_xy * e_neg
+
+    sum_e_pos = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(e_pos), e_pos)
+    sum_e_neg = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(e_neg), e_neg)
+    sum_xe_pos = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(xe_pos), xe_pos)
+    sum_xe_neg = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(xe_neg), xe_neg)
+
+    wa_max = sum_xe_pos / sum_e_pos.clamp_min(1e-30)
+    wa_min = sum_xe_neg / sum_e_neg.clamp_min(1e-30)
+    hpwl_per_net = (wa_max - wa_min).sum(dim=1)
+    return (net_weights * hpwl_per_net).sum()
+
 
 def _lse_wirelength(pin_xy: torch.Tensor, pin_net: torch.Tensor,
                     num_nets: int, net_weights: torch.Tensor,
@@ -277,7 +352,9 @@ def _multiscale_gaussian_density_loss(positions: torch.Tensor, sizes: torch.Tens
                                       scales=(8, 16, 32, 64),
                                       tilos_gxgy: tuple = None,
                                       sigma_bins: float = 1.5,
-                                      topk_frac: float = 0.10) -> torch.Tensor:
+                                      topk_frac: float = 0.10,
+                                      asymmetric: bool = False,
+                                      coulomb_w: float = 0.1) -> torch.Tensor:
     """
     Long-range density loss: at each scale, smooth density grid with Gaussian,
     take squared overflow above target, sum over scales.
@@ -312,6 +389,10 @@ def _multiscale_gaussian_density_loss(positions: torch.Tensor, sizes: torch.Tens
                 density = density + fixed_density_floor[key]
 
         diff = density - target_per_bin
+        if asymmetric:
+            # TILOS only penalizes top-10% bins — match by penalizing only
+            # over-density. Allows under-filled regions without penalty.
+            diff = F.relu(diff)
         loss = loss + (diff * diff).sum()
 
         # Coulomb (1/r) kernel: long-range coupling via direct convolution.
@@ -325,8 +406,91 @@ def _multiscale_gaussian_density_loss(positions: torch.Tensor, sizes: torch.Tens
             kernel = _coulomb_kernel_2d(ksize, density.device, density.dtype)
             potential = F.conv2d(density.unsqueeze(0).unsqueeze(0), kernel,
                                  padding=ksize // 2).squeeze(0).squeeze(0)
-            loss = loss + 0.1 * (density * potential).sum()
+            loss = loss + coulomb_w * (density * potential).sum()
     return loss
+
+
+# ----------------------- RUDY congestion ----------------------------------
+
+def _rudy_congestion(pin_xy: torch.Tensor, pin_net: torch.Tensor,
+                     num_nets: int, net_weights: torch.Tensor,
+                     canvas_w: float, canvas_h: float,
+                     grid_x: int, grid_y: int,
+                     gamma: float,
+                     smooth_range: int = 2,
+                     topk_frac: float = 0.05) -> torch.Tensor:
+    """
+    RUDY (Rectangular Uniform Density of Wires) congestion proxy:
+      - For each net, compute LSE-smooth bbox.
+      - Treat each net as a rectangle of size (bbox_w, bbox_h) at its center.
+      - Deposit per-net wire demand uniformly across the bbox via bell deposition.
+      - Smooth with box filter, take top-5% mean (matches TILOS aggregation).
+
+    This more closely matches TILOS's Steiner-routed congestion than pin-density:
+    TILOS distributes wire demand across the net's bounding rectangle.
+    """
+    device = pin_xy.device
+    dtype = pin_xy.dtype
+
+    # Per-net hard max/min for stability
+    very_neg = torch.full((num_nets, 2), -1e9, device=device, dtype=dtype)
+    very_pos = torch.full((num_nets, 2), 1e9, device=device, dtype=dtype)
+    pin_max = very_neg.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
+                                       pin_xy, reduce="amax", include_self=True)
+    pin_min = very_pos.scatter_reduce(0, pin_net.unsqueeze(1).expand_as(pin_xy),
+                                       pin_xy, reduce="amin", include_self=True)
+
+    # LSE smooth bbox
+    e_pos = torch.exp((pin_xy - pin_max[pin_net]) / gamma)
+    e_neg = torch.exp(-(pin_xy - pin_min[pin_net]) / gamma)
+    s_pos = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(e_pos), e_pos)
+    s_neg = torch.zeros((num_nets, 2), device=device, dtype=dtype).scatter_add_(
+        0, pin_net.unsqueeze(1).expand_as(e_neg), e_neg)
+    bb_max = pin_max + gamma * torch.log(s_pos.clamp_min(1e-30))  # [num_nets, 2]
+    bb_min = pin_min - gamma * torch.log(s_neg.clamp_min(1e-30))  # [num_nets, 2]
+
+    bb_size = (bb_max - bb_min).clamp_min(1e-3)         # [num_nets, 2]
+    bb_center = (bb_max + bb_min) * 0.5                  # [num_nets, 2]
+
+    # Bell deposition for each net (treated as a rect centered at bb_center,
+    # of size bb_size). Same code as _density_at_scale but with net-specific
+    # weights instead of macro areas.
+    bin_w = canvas_w / grid_x
+    bin_h = canvas_h / grid_y
+    bx = (torch.arange(grid_x, device=device, dtype=dtype) + 0.5) * bin_w
+    by = (torch.arange(grid_y, device=device, dtype=dtype) + 0.5) * bin_h
+
+    hw = bb_size[:, 0] / 2 + bin_w / 2
+    hh = bb_size[:, 1] / 2 + bin_h / 2
+
+    dx = bx.unsqueeze(0) - bb_center[:, 0:1]   # [num_nets, grid_x]
+    dy = by.unsqueeze(0) - bb_center[:, 1:2]   # [num_nets, grid_y]
+    wx = F.relu(1.0 - dx.abs() / hw.unsqueeze(1))
+    wy = F.relu(1.0 - dy.abs() / hh.unsqueeze(1))
+    nx = wx.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    ny = wy.sum(dim=1, keepdim=True).clamp_min(1e-9)
+    wxn = wx / nx
+    wyn = wy / ny
+
+    # Demand per net per bin: net_weight * unit (since bell is normalized).
+    # The "rectangular uniform density" interpretation says contribution to a
+    # bin is w_n / bbox_area for in-bbox cells; here we use the bell-normalized
+    # version which is differentiable. Mass conservation: each net deposits
+    # exactly net_weight worth of density into the grid.
+    contrib = net_weights.unsqueeze(1)          # [num_nets, 1]
+    grid = (contrib * wyn).t() @ wxn             # [grid_y, grid_x]
+
+    if smooth_range > 0:
+        ksize = 2 * smooth_range + 1
+        kernel = torch.ones(1, 1, ksize, ksize, device=device, dtype=dtype) / (ksize * ksize)
+        grid = F.conv2d(grid.unsqueeze(0).unsqueeze(0), kernel,
+                        padding=smooth_range).squeeze(0).squeeze(0)
+
+    flat = grid.flatten()
+    k = max(1, int(flat.numel() * topk_frac))
+    top, _ = flat.topk(k)
+    return top.mean()
 
 
 # ----------------------- pin-density congestion ---------------------------
@@ -389,16 +553,24 @@ class AdityaPlacerV4:
                  seed: int = 42,
                  global_iters: int = 800,
                  swap_iters: int = 0,
-                 lr_frac: float = 0.005,
+                 lr_frac: float = 0.003,
                  ov_start: float = 20.0,
                  ov_end: float = 2000.0,
                  den_w: float = 5.0,
-                 cong_w: float = 1.0,
+                 cong_w: float = 0.05,
                  bd_w: float = 100.0,
                  anchor_k: int = 0,  # disabled — hypothesis A rejected
                  anchor_w: float = 5.0,
                  anchor_frac: float = 0.5,
                  init_mode: str = "given",  # "given" | "center"
+                 ignore_net_degree: int = 30,  # filter clock/scan/reset broadcast nets
+                 cluster_pins_on_macro: bool = False,
+                 asymmetric_density: bool = False,
+                 coulomb_w: float = 0.1,
+                 wl_mode: str = "wa",  # "lse" | "wa"
+                 cong_mode: str = "pin_density",  # "pin_density" | "rudy"
+                 lr_schedule: str = "constant",  # "constant" | "cosine"
+                 lr_end_frac: float = 0.1,  # cosine end = lr_frac * lr_end_frac
                  verbose: bool = False):
         self.seed = seed
         self.global_iters = global_iters
@@ -413,6 +585,14 @@ class AdityaPlacerV4:
         self.anchor_w = anchor_w
         self.anchor_frac = anchor_frac
         self.init_mode = init_mode
+        self.ignore_net_degree = ignore_net_degree
+        self.cluster_pins_on_macro = cluster_pins_on_macro
+        self.asymmetric_density = asymmetric_density
+        self.coulomb_w = coulomb_w
+        self.wl_mode = wl_mode
+        self.cong_mode = cong_mode
+        self.lr_schedule = lr_schedule
+        self.lr_end_frac = lr_end_frac
         self.verbose = verbose
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -455,7 +635,11 @@ class AdityaPlacerV4:
 
         # Build pin arrays (with offsets)
         plc = _load_plc_for_benchmark(benchmark.name)
-        pin_data = _build_pin_arrays(benchmark, plc) if plc is not None else None
+        pin_data = _build_pin_arrays(
+            benchmark, plc,
+            ignore_net_degree=self.ignore_net_degree,
+            cluster_pins_on_macro=self.cluster_pins_on_macro,
+        ) if plc is not None else None
 
         if pin_data is None:
             # Fallback: point-macro pins (no offsets) — degrades quality
@@ -553,8 +737,8 @@ class AdityaPlacerV4:
             )
 
         gamma = 0.01 * scale  # reverted from H
-        lr = self.lr_frac * scale
-        opt = torch.optim.Adam([hard_var], lr=lr)
+        lr_init = self.lr_frac * scale
+        opt = torch.optim.Adam([hard_var], lr=lr_init)
 
         log_ov_start = math.log(self.ov_start)
         log_ov_end = math.log(self.ov_end)
@@ -564,6 +748,13 @@ class AdityaPlacerV4:
 
         t0 = time.time()
         for step in range(self.global_iters):
+            # Cosine LR schedule (optional)
+            if self.lr_schedule == "cosine":
+                t_lr = step / max(self.global_iters - 1, 1)
+                cosine = 0.5 * (1 + math.cos(math.pi * t_lr))
+                lr_now = lr_init * (self.lr_end_frac + (1 - self.lr_end_frac) * cosine)
+                for g in opt.param_groups:
+                    g["lr"] = lr_now
             opt.zero_grad()
             cur_hard = hard_var
             if (~movable_hard).any():
@@ -583,7 +774,8 @@ class AdityaPlacerV4:
 
             # WL via LSE
             t = step / max(self.global_iters - 1, 1)
-            wl = _lse_wirelength(owner_pos, pin_net, num_nets, net_weights, gamma)
+            wl_fn = _wa_wirelength if self.wl_mode == "wa" else _lse_wirelength
+            wl = wl_fn(owner_pos, pin_net, num_nets, net_weights, gamma)
             wl_norm = wl / ((cw + ch) * net_weights.sum().clamp_min(1.0))
 
             # Multi-scale Gaussian density with fixed soft-macro floor
@@ -592,11 +784,19 @@ class AdityaPlacerV4:
                 cur_hard, sizes_hard, cw, ch,
                 fixed_density_floor=fixed_density_floor,
                 tilos_gxgy=(tilos_gc, tilos_gr),
+                asymmetric=self.asymmetric_density,
+                coulomb_w=self.coulomb_w,
             )
 
-            # Pin-density congestion (32x32 grid, original v4)
-            cong = _pin_density_congestion(owner_pos, pin_net, net_weights,
-                                            cw, ch, grid_x=32, grid_y=32)
+            # Congestion proxy
+            if self.cong_mode == "rudy":
+                # RUDY at TILOS grid resolution to match scoring
+                cong = _rudy_congestion(owner_pos, pin_net, num_nets, net_weights,
+                                         cw, ch, grid_x=tilos_gc, grid_y=tilos_gr,
+                                         gamma=gamma)
+            else:
+                cong = _pin_density_congestion(owner_pos, pin_net, net_weights,
+                                                cw, ch, grid_x=32, grid_y=32)
 
             # Boundary penalty
             hw = sizes_hard[:, 0] / 2
