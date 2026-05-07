@@ -240,6 +240,171 @@ def basin_hop(positions: torch.Tensor,
     return best_pos
 
 
+def parallel_tempering(positions: torch.Tensor,
+                       benchmark: Benchmark,
+                       plc,
+                       n_chains: int = 4,
+                       T_min_frac: float = 0.001,
+                       T_max_frac: float = 0.05,
+                       n_swap_rounds: int = 20,
+                       sa_steps_per_round: int = 2000,
+                       step_init_frac: float = 0.05,
+                       step_end_frac: float = 0.0005,
+                       time_budget: float = 600.0,
+                       seed: int = 0,
+                       verbose: bool = False) -> torch.Tensor:
+    """
+    Parallel-tempering / replica-exchange wrapper around single-macro SA.
+
+    Run `n_chains` chains in round-robin, each at its own fixed temperature
+    on a geometric ladder. Hot chains tunnel barriers, cold chains refine.
+    Between rounds, propose Metropolis swaps of full configurations between
+    adjacent chains using the canonical PT criterion:
+        P(swap i,j) = min(1, exp((1/T_i - 1/T_j) * (E_i - E_j)))
+
+    Best position is tracked on cold chain via real TILOS proxy (validated
+    each round). Step size anneals geometrically across rounds (shared across
+    all chains; their differing T's still produce different acceptance rates).
+
+    `positions`: [num_macros, 2] post-legalize tensor.
+    Returns best positions found across all chains.
+    """
+    rng = random.Random(seed)
+    n_hard = benchmark.num_hard_macros
+    movable = benchmark.get_movable_mask()[:n_hard].numpy()
+    movable_idx = np.where(movable)[0].tolist()
+    if not movable_idx:
+        return positions
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    scale = max(cw, ch)
+
+    # Build n_chains IncrementalProxy instances, each from the same positions.
+    orig_positions = benchmark.macro_positions.clone()
+    benchmark.macro_positions = positions.clone()
+    try:
+        chains = [IncrementalProxy(benchmark) for _ in range(n_chains)]
+    finally:
+        benchmark.macro_positions = orig_positions
+
+    # T ladder geometric from T_min to T_max, anchored to initial proxy.
+    initial_proxy = chains[0].proxy()
+    T_min = T_min_frac * initial_proxy
+    T_max = T_max_frac * initial_proxy
+    if n_chains == 1:
+        T_ladder = [T_min]
+    else:
+        ratio = (T_max / T_min) ** (1.0 / (n_chains - 1))
+        T_ladder = [T_min * (ratio ** k) for k in range(n_chains)]
+
+    # Tracking
+    initial_real = compute_proxy_cost(positions, benchmark, plc)["proxy_cost"]
+    best_real = initial_real
+    best_positions = positions.clone()
+    sa_accepts = [0] * n_chains
+    sa_rejects = [0] * n_chains
+    swap_attempts = 0
+    swap_accepts = 0
+
+    if verbose:
+        print(f"  [PT] init real={initial_real:.4f} T_ladder={[f'{t:.4f}' for t in T_ladder]}")
+
+    t0 = time.time()
+    step0 = scale * step_init_frac
+    step_end = scale * step_end_frac
+    if n_swap_rounds > 1:
+        step_decay_per_round = (step_end / step0) ** (1.0 / (n_swap_rounds - 1))
+    else:
+        step_decay_per_round = 1.0
+    step = step0
+
+    for round_idx in range(n_swap_rounds):
+        if time.time() - t0 > time_budget:
+            if verbose:
+                print(f"  [PT] time budget hit at round {round_idx}")
+            break
+
+        # Advance each chain at its own T
+        for c, incp in enumerate(chains):
+            T = T_ladder[c]
+            for sa_step in range(sa_steps_per_round):
+                i = rng.choice(movable_idx)
+                old_x = float(incp.positions[i, 0])
+                old_y = float(incp.positions[i, 1])
+                hw = float(incp.sizes[i, 0] / 2)
+                hh = float(incp.sizes[i, 1] / 2)
+                nx, ny = _propose_move(rng, old_x, old_y, hw, hh, cw, ch, step)
+                # Quick overlap check
+                incp.positions[i, 0] = nx
+                incp.positions[i, 1] = ny
+                if incp.overlaps_any(i):
+                    incp.positions[i, 0] = old_x
+                    incp.positions[i, 1] = old_y
+                    sa_rejects[c] += 1
+                    continue
+                # Restore for proper move_macro semantics
+                incp.positions[i, 0] = old_x
+                incp.positions[i, 1] = old_y
+                old_proxy = incp.proxy()
+                incp.move_macro(i, nx, ny)
+                new_proxy = incp.proxy()
+                delta = new_proxy - old_proxy
+                if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-12)):
+                    sa_accepts[c] += 1
+                else:
+                    incp.move_macro(i, old_x, old_y)
+                    sa_rejects[c] += 1
+
+        # Validate cold chain (chain 0) against TILOS proxy and update best.
+        cold = chains[0]
+        new_pos = positions.clone()
+        new_pos[:n_hard, 0] = torch.from_numpy(cold.positions[:n_hard, 0]).float()
+        new_pos[:n_hard, 1] = torch.from_numpy(cold.positions[:n_hard, 1]).float()
+        real_now = compute_proxy_cost(new_pos, benchmark, plc)["proxy_cost"]
+        if real_now < best_real:
+            best_real = real_now
+            best_positions = new_pos.clone()
+
+        # Try adjacent swaps (alternate even/odd pairs each round).
+        # Standard PT: P_accept = min(1, exp((β_i - β_j) * (E_i - E_j)))
+        # where β = 1/T. With i hotter (lower β), j colder (higher β):
+        #   exp((β_j - β_i) * (E_j - E_i))  reduces to standard form.
+        pair_offset = round_idx % 2
+        for c in range(pair_offset, n_chains - 1, 2):
+            E_lo = chains[c].proxy()
+            E_hi = chains[c + 1].proxy()
+            beta_lo = 1.0 / max(T_ladder[c], 1e-12)
+            beta_hi = 1.0 / max(T_ladder[c + 1], 1e-12)
+            log_p = (beta_lo - beta_hi) * (E_lo - E_hi)
+            swap_attempts += 1
+            if log_p >= 0 or rng.random() < math.exp(log_p):
+                # Swap full configurations: snapshot then restore on swapped target
+                snap_lo = chains[c].snapshot()
+                snap_hi = chains[c + 1].snapshot()
+                chains[c].restore(snap_hi)
+                chains[c + 1].restore(snap_lo)
+                swap_accepts += 1
+
+        if verbose:
+            tot_acc = sum(sa_accepts)
+            tot_rej = sum(sa_rejects)
+            chain_proxies = [f"{c.proxy():.4f}" for c in chains]
+            print(f"  [PT round {round_idx}] step={step:.1f} sa+/-={tot_acc}/{tot_rej} "
+                  f"swap+/-={swap_accepts}/{swap_attempts} "
+                  f"chains_proxy={chain_proxies} cold_real={real_now:.4f} "
+                  f"best={best_real:.4f}")
+
+        step *= step_decay_per_round
+
+    if verbose:
+        elapsed = time.time() - t0
+        improv = (best_real - initial_real) / initial_real * 100
+        print(f"  [PT] DONE in {elapsed:.1f}s | start={initial_real:.4f} "
+              f"-> best={best_real:.4f} ({improv:+.2f}%) | swaps={swap_accepts}/{swap_attempts}")
+
+    return best_positions
+
+
 def lns_refine(positions: torch.Tensor,
                benchmark: Benchmark,
                plc,
